@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' https: blob: data:; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https: blob:; connect-src 'self' https: blob:; media-src 'self' https: blob: data:; worker-src 'self' blob: https:; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline' https:;">
+  <title>Separação local</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background:#101218; color:#f2f3f7; }
+    body { margin:0; padding:18px; }
+    h1 { font-size:23px; margin:5px 0 4px; }
+    p { color:#b9bdc9; line-height:1.45; }
+    .pill { display:inline-block; border:1px solid #3b6d59; color:#9ce0ba; border-radius:999px; padding:5px 10px; font-size:12px; }
+    .status { margin:14px 0; border-radius:12px; background:#1c202b; padding:13px; white-space:pre-wrap; overflow-wrap:anywhere; }
+    .meter { height:6px; border-radius:99px; background:#2b3040; overflow:hidden; margin:10px 0; }
+    .fill { height:100%; width:0; background:#67d5a2; transition:width .25s; }
+    .stem { background:#1b1f2a; border:1px solid #303746; padding:14px; border-radius:14px; margin:12px 0; }
+    .actions { display:flex; gap:8px; }
+    .actions button { flex:1; }
+    .stem h2 { font-size:17px; margin:0 0 10px; }
+    audio { width:100%; margin:5px 0 10px; }
+    button { border:0; border-radius:10px; background:#61d29b; color:#08130d; padding:11px 15px; font-weight:700; font-size:14px; }
+    button[disabled] { opacity:.55; }
+    .small { font-size:12px; color:#a6acbb; }
+    #results { margin-top:14px; }
+    .warn { color:#f0cf84; }
+  </style>
+</head>
+<body>
+  <span class="pill">PROCESSAMENTO NO DISPOSITIVO</span>
+  <h1>Separar vocal e instrumental</h1>
+  <p id="sourceName">Preparando o arquivo…</p>
+  <div class="status" id="status">Iniciando motor MDX-Net…</div>
+  <div class="meter"><div id="meterFill" class="fill"></div></div>
+  <p class="small">O áudio selecionado é lido do armazenamento privado do app e processado neste aparelho. Na primeira execução, o motor e o modelo precisam ser baixados; a música não é enviada para um serviço de separação.</p>
+  <p class="small warn">A velocidade depende do processador, da memória disponível e do tamanho da música. Não feche o app durante a separação.</p>
+  <div id="results"></div>
+  <script type="module">
+    const statusEl = document.getElementById('status');
+    const meterFill = document.getElementById('meterFill');
+    const resultsEl = document.getElementById('results');
+    const say = (message) => {
+      statusEl.textContent = message;
+      try { window.AndroidBridge?.reportStatus(message); } catch (_) {}
+    };
+    const progress = (value) => meterFill.style.width = `${Math.max(0, Math.min(100, value))}%`;
+    const safeBase = (value) => (value || 'audio').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 70);
+
+    async function saveBlob(blob, tempFilename, outputFilename, button, format) {
+      button.disabled = true;
+      const originalText = button.textContent;
+      try {
+        window.AndroidBridge.beginSave(tempFilename);
+        const reader = blob.stream().getReader();
+        let chunkCount = 0;
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          let binary = '';
+          for (let i = 0; i < value.length; i++) binary += String.fromCharCode(value[i]);
+          window.AndroidBridge.writeChunk(tempFilename, btoa(binary));
+          chunkCount++;
+          if (chunkCount % 8 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        if (format === 'flac') window.AndroidBridge.finishSaveAsFlac(tempFilename, outputFilename);
+        else window.AndroidBridge.finishSave(outputFilename);
+        button.textContent = 'Salvo';
+      } catch (error) {
+        say('Falha ao salvar o áudio: ' + (error?.message || error));
+        button.textContent = originalText;
+        button.disabled = false;
+      }
+    }
+
+    async function run() {
+      try {
+        const baseName = safeBase(window.AndroidBridge.getDisplayName());
+        document.getElementById('sourceName').textContent = `Arquivo: ${baseName}`;
+        say('Carregando a biblioteca de separação…');
+        progress(5);
+        const { createSeparator } = await import('https://esm.sh/web-audio-separation@0.3.0?bundle');
+        say('Carregando modelo UVR MDX-Net. A primeira inicialização pode baixar cerca de 67 MB…');
+        progress(12);
+        const separator = createSeparator('UVR-MDX-NET-Voc_FT', {
+          common: { logLevel: 'error', onProgress: (detail) => {
+            if (detail.stage === 'demixing') {
+              const done = detail.chunk || 0;
+              const total = detail.totalChunks || 0;
+              if (total > 0) { progress(35 + Math.round(55 * done / total)); say(`Separando localmente: parte ${done}/${total}…`); }
+            } else if (detail.stage === 'writing-output') {
+              progress(92 + Math.round(7 * (detail.fraction || 0)));
+              say('Finalizando as faixas WAV…');
+            }
+          } },
+          mdx: {
+            segmentSize: 256,
+            overlap: 0.25,
+            batchSize: 1,
+            hopLength: 1024,
+            executionProviders: ['webgpu', 'wasm']
+          }
+        });
+        await separator.loadModel();
+        say('Modelo carregado. Lendo o WAV local…');
+        progress(28);
+        const inputUrl = 'https://appassets.androidplatform.net/input/source.wav';
+        say('Separando vocal e instrumental no aparelho. Isso pode levar alguns minutos…');
+        progress(35);
+        // The library fetches this app-private local URL. No audio is uploaded to a remote host.
+        const stemUrls = await separator.separate(inputUrl);
+        if (!Array.isArray(stemUrls) || stemUrls.length < 2) throw new Error('O modelo não retornou as duas faixas esperadas.');
+        const labels = [
+          { label: 'Instrumental', suffix: 'Instrumental' },
+          { label: 'Vocais', suffix: 'Vocals' }
+        ];
+        for (let i = 0; i < Math.min(stemUrls.length, 2); i++) {
+          const stemResponse = await fetch(stemUrls[i]);
+          const blob = await stemResponse.blob();
+          const url = URL.createObjectURL(blob);
+          const card = document.createElement('section');
+          card.className = 'stem';
+          const title = document.createElement('h2');
+          title.textContent = labels[i].label;
+          const audio = document.createElement('audio');
+          audio.controls = true;
+          audio.preload = 'metadata';
+          audio.src = url;
+          const actions = document.createElement('div');
+          actions.className = 'actions';
+          const wavName = `${baseName}_${labels[i].suffix}.wav`;
+          const wavButton = document.createElement('button');
+          wavButton.textContent = 'Salvar WAV';
+          wavButton.addEventListener('click', () => saveBlob(blob, wavName, wavName, wavButton, 'wav'));
+          const flacButton = document.createElement('button');
+          flacButton.textContent = 'Salvar FLAC';
+          flacButton.addEventListener('click', () => {
+            const tempName = `${baseName}_${labels[i].suffix}_tmp_${Date.now()}.wav`;
+            const flacName = `${baseName}_${labels[i].suffix}.flac`;
+            saveBlob(blob, tempName, flacName, flacButton, 'flac');
+          });
+          actions.append(wavButton, flacButton);
+          card.append(title, audio, actions);
+          resultsEl.appendChild(card);
+          progress(65 + Math.round(35 * (i + 1) / Math.min(stemUrls.length, 2)));
+        }
+        say('Concluído! As faixas foram separadas localmente. Salve cada WAV na pasta Música/AI Vocal Remover.');
+        progress(100);
+      } catch (error) {
+        console.error(error);
+        say(`Não foi possível concluir a separação local.\n${error?.message || String(error)}\n\nVerifique a conexão para baixar o motor/modelo, atualize o Android System WebView e tente novamente. O áudio não foi enviado a um servidor de processamento.`);
+        progress(0);
+      }
+    }
+    run();
+  </script>
+</body>
+</html>
